@@ -2,6 +2,31 @@ from keras.models import load_model
 import cv2
 import numpy as np
 import time
+import os
+import threading
+import pyodbc
+from datetime import datetime
+
+
+def load_env(path=".env"):
+    """Simple .env file reader."""
+    if not os.path.exists(path):
+        return
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            os.environ.setdefault(key.strip(), val.strip())
+
+load_env()
+
+DB_SERVER = os.getenv("DB_SERVER", "")
+DB_DATABASE = os.getenv("DB_DATABASE", "")
+DB_USERNAME = os.getenv("DB_USERNAME", "")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+ROI_FILE = os.getenv("ROI_FILE", "ROI_MESAS.txt")
 
 # Configurações das câmeras
 urls_rtsp = [
@@ -14,9 +39,8 @@ urls_rtsp = [
 ]
 
 # Carregar ROIs de um arquivo de texto
-caminho_arquivo_rois = 'ROI_MESAS.txt'
 rois = []
-with open(caminho_arquivo_rois, 'r') as arquivo:
+with open(ROI_FILE, 'r') as arquivo:
     for linha in arquivo:
         pontos = linha.strip().split(';')
         roi = [tuple(map(int, ponto.split(','))) for ponto in pontos]
@@ -67,10 +91,11 @@ def processar_frame(frame, roi, index):
 
     # Exibir os resultados da previsão com o texto sobre o retângulo preto
     cv2.putText(frame, text, text_position, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness)
-    
+
+    return class_name, confidence_score, frame
 
 
-    # Redimensionar o frame processado e posicionar na tela de saída
+def update_output_screen(frame, index):
     rows = 2
     cols = 3
     tile_w = screen_width // cols
@@ -78,25 +103,56 @@ def processar_frame(frame, roi, index):
     position_x = (index % cols) * tile_w
     position_y = (index // cols) * tile_h
     resized_frame = cv2.resize(frame, (tile_w, tile_h))
-    output_screen[position_y:position_y+tile_h, position_x:position_x+tile_w] = resized_frame
+    output_screen[position_y:position_y + tile_h, position_x:position_x + tile_w] = resized_frame
+
+def camera_worker(index, url, roi, cursor, stop_event, lock):
+    cap = cv2.VideoCapture(url)
+    while not stop_event.is_set():
+        ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.1)
+            continue
+        class_name, confidence, processed = processar_frame(frame, roi, index)
+        with lock:
+            update_output_screen(processed, index)
+        timestamp = datetime.now()
+        data_to_insert = (timestamp, index + 1, class_name, float(confidence))
+        cursor.execute(
+            "INSERT INTO detections (timestamp, roi_number, class_name, confidence_score) VALUES (?, ?, ?, ?)",
+            data_to_insert,
+        )
+        cursor.commit()
+    cap.release()
+
 
 def main():
-    caps = [cv2.VideoCapture(url) for url in urls_rtsp]
+    with pyodbc.connect(
+        f"DRIVER={{SQL Server}};SERVER={DB_SERVER};DATABASE={DB_DATABASE};UID={DB_USERNAME};PWD={DB_PASSWORD}"
+    ) as cnxn:
+        cursor = cnxn.cursor()
+        stop_event = threading.Event()
+        lock = threading.Lock()
+        threads = []
 
-    while True:
-        output_screen.fill(0)  # Limpar a tela antes de atualizar
-        for index, cap in enumerate(caps):
-            ret, frame = cap.read()
-            if ret:
-                processar_frame(frame, rois[index], index)
-        
-        cv2.imshow("Analise de Cameras", output_screen)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+        for index, url in enumerate(urls_rtsp):
+            t = threading.Thread(
+                target=camera_worker,
+                args=(index, url, rois[index], cursor, stop_event, lock),
+                daemon=True,
+            )
+            t.start()
+            threads.append(t)
 
-    # Liberar todos os recursos ao final
-    for cap in caps:
-        cap.release()
+        while True:
+            with lock:
+                display = output_screen.copy()
+            cv2.imshow("Analise de Cameras", display)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                stop_event.set()
+                break
+
+        for t in threads:
+            t.join()
     cv2.destroyAllWindows()
 
 if __name__ == "__main__":
