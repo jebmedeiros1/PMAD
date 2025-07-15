@@ -29,14 +29,10 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 ROI_FILE = os.getenv("ROI_FILE", "ROI_MESAS.txt")
 
 # Configurações das câmeras
-urls_rtsp = [
-    'rtsp://10.8.104.23/streaming/channels/1',
-    'rtsp://10.8.104.28/streaming/channels/1',
-    'rtsp://10.8.104.38/streaming/channels/1',
-    'rtsp://10.8.104.48/streaming/channels/1',
-    'rtsp://root:C@meras5522@10.8.107.50/axis-media/media.amp?videocodec=h264',
-    'rtsp://root:C@meras5522@10.8.105.37/axis-media/media.amp?videocodec=h264'
-]
+urls_rtsp = [os.getenv(f"RTSP_{i+1}") for i in range(6)]
+
+if None in urls_rtsp:
+    raise ValueError("Uma ou mais URLs RTSP não foram definidas no arquivo .env")
 
 # Carregar ROIs de um arquivo de texto
 rois = []
@@ -106,23 +102,28 @@ def update_output_screen(frame, index):
     output_screen[position_y:position_y + tile_h, position_x:position_x + tile_w] = resized_frame
 
 def camera_worker(index, url, roi, cursor, stop_event, lock):
-    cap = cv2.VideoCapture(url)
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
-            time.sleep(0.1)
-            continue
-        class_name, confidence, processed = processar_frame(frame, roi, index)
-        with lock:
-            update_output_screen(processed, index)
-        timestamp = datetime.now()
-        data_to_insert = (timestamp, index + 1, class_name, float(confidence))
-        cursor.execute(
-            "INSERT INTO detections (timestamp, roi_number, class_name, confidence_score) VALUES (?, ?, ?, ?)",
-            data_to_insert,
-        )
-        cursor.commit()
-    cap.release()
+    try:
+        cap = cv2.VideoCapture(url)
+        while not stop_event.is_set():
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(2)
+                continue
+            class_name, confidence, processed = processar_frame(frame, roi, index)
+            with lock:
+                update_output_screen(processed, index)
+            timestamp = datetime.now()
+            data_to_insert = (timestamp, index + 1, class_name, float(confidence))
+            cursor.execute(
+                "INSERT INTO detections (timestamp, roi_number, class_name, confidence_score) VALUES (?, ?, ?, ?)",
+                data_to_insert,
+            )
+            cursor.commit()
+    except Exception as e:
+        print(f"[ERRO] Câmera {index+1} falhou: {e}")
+    finally:
+        cap.release()
+
 
 
 def main():
